@@ -107,8 +107,8 @@ class MotorController:
                 'sync': kwargs.get('sync', 0x00),
                 'check': kwargs.get('check', 0x6B)
             }
-            if not isinstance(params['pulses'], int) or params['pulses'] <= 0:
-                return "错误：脉冲数必须为正整数"
+            if not isinstance(params['pulses'], int) or params['pulses'] < 0:
+                return "错误：脉冲数必须为非负整数"
             try:
                 speed_bytes = params['speed'].to_bytes(2, byteorder='big')
                 pulse_bytes = params['pulses'].to_bytes(4, byteorder='big')
@@ -212,10 +212,8 @@ class MotorController:
                 print(f"电机{resp_addr}已到位")
 
     def close(self):
-        """关闭串口连接"""
-        if self.ser.is_open:
-            self.ser.close()
-            print("串口已关闭")
+        """关闭控制器（串口由 uart_thread 模块管理）"""
+        print("电机控制器已关闭")
 
 
 # 使用示例
