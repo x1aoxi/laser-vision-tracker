@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 import time
 import math
+import threading
 
 import uart_thread as uart
 from motor_cmd import MotorController
@@ -53,6 +54,63 @@ class Config:
 
 
 # ==============================================================================
+# 摄像头采集线程（始终保留最新帧，解决 V4L2 缓冲区延迟）
+# ==============================================================================
+class CameraCapture:
+    """独立线程采集摄像头画面，主线程始终获取最新帧"""
+
+    def __init__(self, camera_id, fps=20, width=160, height=120, exposure=50):
+        self.cap = cv2.VideoCapture(camera_id, cv2.CAP_V4L2)
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        self.cap.set(cv2.CAP_PROP_FPS, fps)
+        self.cap.set(cv2.CAP_PROP_EXPOSURE, exposure)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        try:
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+
+        self._frame = None
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread = None
+
+    def is_opened(self):
+        return self.cap.isOpened()
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._thread.start()
+
+    def _capture_loop(self):
+        while self._running:
+            ret, frame = self.cap.read()
+            if ret:
+                with self._lock:
+                    self._frame = frame
+
+    def read(self):
+        with self._lock:
+            if self._frame is None:
+                return False, None
+            return True, self._frame.copy()
+
+    def release(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=2.0)
+        self.cap.release()
+
+
+# 预创建 CLAHE 对象，避免每帧重建
+_clahe = cv2.createCLAHE(clipLimit=5, tileGridSize=(4, 4))
+
+
+# ==============================================================================
 # 图像处理模块
 # ==============================================================================
 def circle_detection_pipeline(frame, config=Config):
@@ -66,39 +124,36 @@ def circle_detection_pipeline(frame, config=Config):
     Returns:
         dict: 包含circles列表、可视化帧和边缘图
     """
-    # 颜色增强 (YCbCr空间CLAHE)
+    # CLAHE 增强：BGR→YCrCb 提取 Y 通道，增强后直接作为灰度图使用
+    # 省去了 merge→YCrCb→BGR→Gray 三次冗余转换
     ycbcr = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
-    y, cr, cb = cv2.split(ycbcr)
-    clahe = cv2.createCLAHE(clipLimit=5, tileGridSize=(4, 4))
-    y_enhanced = clahe.apply(y)
-    ycbcr_enhanced = cv2.merge([y_enhanced, cr, cb])
-    frame_enhanced = cv2.cvtColor(ycbcr_enhanced, cv2.COLOR_YCrCb2BGR)
+    gray = _clahe.apply(ycbcr[:, :, 0])
 
-    # 预处理
-    gray = cv2.cvtColor(frame_enhanced, cv2.COLOR_BGR2GRAY)
-    gray = cv2.medianBlur(gray, 3)
     gray = cv2.GaussianBlur(gray, (5, 5), 1)
     edges = cv2.Canny(gray, 50, 60)
 
-    # 轮廓检测与圆度筛选
-    contours, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     circles = []
+    min_area = config.CIRCLE_MIN_AREA
+    min_circularity = config.CIRCLE_CIRCULARITY
+    min_r = config.CIRCLE_MIN_RADIUS
+    max_r = config.CIRCLE_MAX_RADIUS
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < config.CIRCLE_MIN_AREA:
+        if area < min_area:
             continue
 
         perimeter = cv2.arcLength(cnt, True)
         if perimeter == 0:
             continue
 
-        circularity = (4 * np.pi * area) / (perimeter ** 2)
-        if circularity < config.CIRCLE_CIRCULARITY:
+        circularity = (4 * np.pi * area) / (perimeter * perimeter)
+        if circularity < min_circularity:
             continue
 
         (x, y), r = cv2.minEnclosingCircle(cnt)
-        if config.CIRCLE_MIN_RADIUS <= r <= config.CIRCLE_MAX_RADIUS:
+        if min_r <= r <= max_r:
             circles.append((int(x), int(y), int(r)))
 
     return {
@@ -108,14 +163,13 @@ def circle_detection_pipeline(frame, config=Config):
     }
 
 
-def rectangle_detection_pipeline(frame, config=Config, draw=False):
+def rectangle_detection_pipeline(frame, config=Config):
     """
     矩形检测管道
 
     Args:
         frame: 输入图像帧
         config: 配置参数
-        draw: 是否绘制检测结果
 
     Returns:
         dict: 包含max_rect(最大矩形)、可视化帧和边缘图
@@ -125,18 +179,18 @@ def rectangle_detection_pipeline(frame, config=Config, draw=False):
     edges = cv2.Canny(gray, 60, 180)
 
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    candidate_rects = []
+
+    max_rect = None
+    max_area = config.RECT_MIN_AREA
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < config.RECT_MIN_AREA:
+        if area < max_area:
             continue
 
         perimeter = cv2.arcLength(cnt, True)
-        epsilon = 0.02 * perimeter
-        approx = cv2.approxPolyDP(cnt, epsilon, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * perimeter, True)
 
-        # 四边形凸性检测
         if len(approx) == 4 and cv2.isContourConvex(approx):
             rect = cv2.minAreaRect(approx)
             (x_center, y_center), (w, h), angle = rect
@@ -146,22 +200,17 @@ def rectangle_detection_pipeline(frame, config=Config, draw=False):
 
             if config.RECT_MIN_ASPECT <= aspect_ratio <= config.RECT_MAX_ASPECT:
                 box = np.int0(cv2.boxPoints(rect))
-                candidate_rects.append({
+                max_rect = {
                     "area": area,
                     "center": (int(x_center), int(y_center)),
                     "box": box,
                     "angle": angle
-                })
-
-    # 选取最大矩形
-    max_rect = None
-    if candidate_rects:
-        candidate_rects.sort(key=lambda x: x["area"], reverse=True)
-        max_rect = candidate_rects[0]
+                }
+                max_area = area
 
     return {
         "max_rect": max_rect,
-        "visualization": frame.copy() if draw else frame,
+        "visualization": frame,
         "edges": edges
     }
 
@@ -245,28 +294,26 @@ def locked(motor, center_x, center_y, center_px, center_py,
     # X轴控制
     error_x = center_x - center_px
     if abs(error_x) <= error:
-        motor.send_command(uart.uart_send, 'pos', pulsesx=0, addr=0x01, speed=0, pos_mode=0)
+        motor.send_command(uart.uart_send, 'pos', pulses=1, addr=0x01, speed=0, pos_mode=0)
         pid_x.integral_sum = 0
     else:
         pid_output_x = pid_x.pid_control(error_x, last_error_x, dt)
-        pulses_x = min(int(abs(pid_output_x)), pulses_max)
+        pulses_x = max(1, min(int(abs(pid_output_x)), pulses_max))
         direction = 1 if error_x > 0 else 0
-        motor.send_command(uart.uart_send, 'pos', pulsesx=pulses_x, addr=0x01,
+        motor.send_command(uart.uart_send, 'pos', pulses=pulses_x, addr=0x01,
                           speed=1, pos_mode=0, dir=direction)
-    time.sleep(0.001)
 
     # Y轴控制
     error_y = center_y - center_py
     if abs(error_y) <= error:
-        motor.send_command(uart.uart_send, 'pos', pulsesy=0, addr=0x02, speed=0, pos_mode=0)
+        motor.send_command(uart.uart_send, 'pos', pulses=1, addr=0x02, speed=0, pos_mode=0)
         pid_y.integral_sum = 0
     else:
         pid_output_y = pid_y.pid_control(error_y, last_error_y, dt)
-        pulses_y = min(int(abs(pid_output_y)), pulses_max)
+        pulses_y = max(1, min(int(abs(pid_output_y)), pulses_max))
         direction = 1 if error_y > 0 else 0
-        motor.send_command(uart.uart_send, 'pos', pulsesy=pulses_y, addr=0x02,
+        motor.send_command(uart.uart_send, 'pos', pulses=pulses_y, addr=0x02,
                           speed=1, pos_mode=0, dir=direction)
-    time.sleep(0.001)
 
     return error_x, error_y
 
@@ -285,7 +332,7 @@ def task_rectangle_lock(frame, motor, pid_x, pid_y, center_px, center_py,
     任务1：检测矩形并锁定中心，稳定后开启激光
     """
     last_error_x, last_error_y = last_errors
-    rect_result = rectangle_detection_pipeline(frame, draw=True)
+    rect_result = rectangle_detection_pipeline(frame)
     max_rect = rect_result["max_rect"]
     visualization = rect_result["visualization"]
 
@@ -323,8 +370,8 @@ def task_rectangle_lock(frame, motor, pid_x, pid_y, center_px, center_py,
         Task1State.stable_count = 0
         laser.off()
         laser_state["active"] = False
-        motor.send_command(uart.uart_send, 'pos', pulsesx=0, addr=0x01, speed=0, pos_mode=0)
-        motor.send_command(uart.uart_send, 'pos', pulsesy=0, addr=0x02, speed=0, pos_mode=0)
+        motor.send_command(uart.uart_send, 'pos', pulses=1, addr=0x01, speed=0, pos_mode=0)
+        motor.send_command(uart.uart_send, 'pos', pulses=1, addr=0x02, speed=0, pos_mode=0)
         pid_x.integral_sum = 0
         pid_y.integral_sum = 0
         return (last_error_x, last_error_y), visualization
@@ -385,12 +432,12 @@ def task_circle_lock(frame, motor, center_px, center_py, last_errors, dt,
     else:
         if searching:
             # 搜索模式：按指定方向旋转
-            motor.send_command(uart.uart_send, 'pos', pulsesx=100, addr=0x01,
+            motor.send_command(uart.uart_send, 'pos', pulses=100, addr=0x01,
                               speed=200, acc=210, pos_mode=0, dir=search_dir)
         else:
             # 停止
-            motor.send_command(uart.uart_send, 'pos', pulsesx=0, addr=0x01, speed=0, pos_mode=0)
-            motor.send_command(uart.uart_send, 'pos', pulsesy=0, addr=0x02, speed=0, pos_mode=0)
+            motor.send_command(uart.uart_send, 'pos', pulses=1, addr=0x01, speed=0, pos_mode=0)
+            motor.send_command(uart.uart_send, 'pos', pulses=1, addr=0x02, speed=0, pos_mode=0)
             Task2State.pid_x.integral_sum = 0
             Task2State.pid_y.integral_sum = 0
 
@@ -485,8 +532,8 @@ def main():
         time.sleep(0.05)
 
     def _stop_motors():
-        motor.send_command(uart.uart_send, 'pos', pulsesx=0, addr=0x01, speed=0, pos_mode=0)
-        motor.send_command(uart.uart_send, 'pos', pulsesy=0, addr=0x02, speed=0, pos_mode=0)
+        motor.send_command(uart.uart_send, 'pos', pulses=1, addr=0x01, speed=0, pos_mode=0)
+        motor.send_command(uart.uart_send, 'pos', pulses=1, addr=0x02, speed=0, pos_mode=0)
         pid_x.integral_sum = 0
         pid_y.integral_sum = 0
 
@@ -496,17 +543,20 @@ def main():
     button3.add_callback(on_button3_pressed, 'pressed')
     button_manager.start_monitoring(poll_interval=0.05)
 
-    # 初始化摄像头
-    cap = cv2.VideoCapture(Config.CAMERA_ID, cv2.CAP_V4L2)
-    cap.set(cv2.CAP_PROP_FPS, Config.CAMERA_FPS)
-    cap.set(cv2.CAP_PROP_EXPOSURE, Config.CAMERA_EXPOSURE)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, Config.CAMERA_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, Config.CAMERA_HEIGHT)
+    # 初始化摄像头（独立采集线程，始终获取最新帧）
+    cam = CameraCapture(
+        Config.CAMERA_ID,
+        fps=Config.CAMERA_FPS,
+        width=Config.CAMERA_WIDTH,
+        height=Config.CAMERA_HEIGHT,
+        exposure=Config.CAMERA_EXPOSURE
+    )
 
-    if not cap.isOpened():
+    if not cam.is_opened():
         print("错误：无法打开摄像头")
         return
+
+    cam.start()
 
     print("=" * 50)
     print("激光视觉追踪系统 - 初始化完成")
@@ -523,9 +573,9 @@ def main():
     # 主循环
     try:
         while True:
-            ret, frame = cap.read()
+            ret, frame = cam.read()
             if not ret:
-                break
+                continue
 
             current_time = time.time()
             dt = current_time - last_time
@@ -551,16 +601,13 @@ def main():
                     search_dir=circle_mode
                 )
             else:
-                # 空闲状态：显示检测预览
-                visualized_frame = frame.copy()
-                cv2.putText(visualized_frame, "Ready | Btn1:Rect Btn2:Circle(L) Btn3:Circle(R)",
-                           (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1)
+                visualized_frame = frame
 
     except KeyboardInterrupt:
         print("\n程序被中断")
     finally:
         button_manager.cleanup()
-        cap.release()
+        cam.release()
         laser.off()
         print("程序已退出")
 
