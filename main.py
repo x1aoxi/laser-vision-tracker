@@ -8,6 +8,7 @@ import numpy as np
 import time
 import math
 import threading
+import queue
 
 import uart_thread as uart
 from motor_cmd import MotorController
@@ -465,9 +466,9 @@ def main():
     button_manager.add_button(button2)
     button_manager.add_button(button3)
 
-    # 状态变量
-    lock_enabled = False      # 任务1激活
-    circle_mode = None        # 圆形模式 (None/0=左转/1=右转)
+    # 状态变量（全部只在主线程中读写）
+    lock_enabled = False
+    circle_mode = None
     last_rect_errors = (0, 0)
     last_circle_errors = (0, 0)
     searching_for_circle = False
@@ -477,52 +478,19 @@ def main():
     pid_x = PID(kp=1, ki=0.3, kd=0.2)
     pid_y = PID(kp=1, ki=0.3, kd=0.2)
 
-    # 按键回调函数
-    def on_button1_pressed(button):
-        nonlocal lock_enabled, circle_mode, searching_for_circle
-        lock_enabled = not lock_enabled
-        circle_mode = None
-        searching_for_circle = False
+    # 按键事件队列：回调只投递事件，不做任何状态修改或阻塞操作
+    button_event_queue = queue.Queue()
 
-        if lock_enabled:
-            print("=== 任务1：矩形锁定已启动 ===")
-            motor.send_command(uart.uart_send, 'enable', enable=0x01, addr=0x01)
-            time.sleep(0.01)
-            motor.send_command(uart.uart_send, 'enable', enable=0x01, addr=0x02)
-        else:
-            print("=== 任务1：矩形锁定已停止 ===")
-            _stop_motors()
+    def on_button1_pressed(button):
+        button_event_queue.put('task_rect')
 
     def on_button2_pressed(button):
-        nonlocal circle_mode, lock_enabled, searching_for_circle
-        circle_mode = 0 if circle_mode != 0 else None
-        lock_enabled = False
-
-        if circle_mode == 0:
-            print("=== 任务2：圆形锁定已启动（左转搜索） ===")
-            _enable_and_home_motors()
-            searching_for_circle = True
-        else:
-            print("=== 任务2：圆形锁定已停止 ===")
-            laser.off()
-            _stop_motors()
-            searching_for_circle = False
+        button_event_queue.put('task_circle_left')
 
     def on_button3_pressed(button):
-        nonlocal circle_mode, lock_enabled, searching_for_circle
-        circle_mode = 1 if circle_mode != 1 else None
-        lock_enabled = False
+        button_event_queue.put('task_circle_right')
 
-        if circle_mode == 1:
-            print("=== 任务3：圆形锁定已启动（右转搜索） ===")
-            _enable_and_home_motors()
-            searching_for_circle = True
-        else:
-            print("=== 任务3：圆形锁定已停止 ===")
-            laser.off()
-            _stop_motors()
-            searching_for_circle = False
-
+    # 辅助函数（在主线程中被调用）
     def _enable_and_home_motors():
         motor.send_command(uart.uart_send, 'enable', enable=0x01, addr=0x01)
         time.sleep(0.01)
@@ -534,8 +502,70 @@ def main():
     def _stop_motors():
         motor.send_command(uart.uart_send, 'pos', pulses=1, addr=0x01, speed=0, pos_mode=0)
         motor.send_command(uart.uart_send, 'pos', pulses=1, addr=0x02, speed=0, pos_mode=0)
-        pid_x.integral_sum = 0
-        pid_y.integral_sum = 0
+        pid_x.reset()
+        pid_y.reset()
+
+    def _reset_common_state():
+        """切换任务时重置公共状态"""
+        nonlocal last_rect_errors, last_circle_errors
+        Task1State.stable_count = 0
+        Task2State.initialized = False
+        laser.off()
+        laser_state["active"] = False
+        laser_state["start_time"] = 0
+        last_rect_errors = (0, 0)
+        last_circle_errors = (0, 0)
+
+    def handle_button_event(event):
+        """在主线程中处理按键事件，所有状态修改集中在这里"""
+        nonlocal lock_enabled, circle_mode, searching_for_circle
+
+        if event == 'task_rect':
+            lock_enabled = not lock_enabled
+            circle_mode = None
+            searching_for_circle = False
+            _reset_common_state()
+
+            if lock_enabled:
+                print("=== 任务1：矩形锁定已启动 ===")
+                pid_x.reset()
+                pid_y.reset()
+                motor.send_command(uart.uart_send, 'enable', enable=0x01, addr=0x01)
+                time.sleep(0.01)
+                motor.send_command(uart.uart_send, 'enable', enable=0x01, addr=0x02)
+            else:
+                print("=== 任务1：矩形锁定已停止 ===")
+                _stop_motors()
+
+        elif event == 'task_circle_left':
+            was_active = (circle_mode == 0)
+            circle_mode = None if was_active else 0
+            lock_enabled = False
+            searching_for_circle = False
+            _reset_common_state()
+
+            if circle_mode == 0:
+                print("=== 任务2：圆形锁定已启动（左转搜索） ===")
+                _enable_and_home_motors()
+                searching_for_circle = True
+            else:
+                print("=== 任务2：圆形锁定已停止 ===")
+                _stop_motors()
+
+        elif event == 'task_circle_right':
+            was_active = (circle_mode == 1)
+            circle_mode = None if was_active else 1
+            lock_enabled = False
+            searching_for_circle = False
+            _reset_common_state()
+
+            if circle_mode == 1:
+                print("=== 任务3：圆形锁定已启动（右转搜索） ===")
+                _enable_and_home_motors()
+                searching_for_circle = True
+            else:
+                print("=== 任务3：圆形锁定已停止 ===")
+                _stop_motors()
 
     # 绑定回调
     button1.add_callback(on_button1_pressed, 'pressed')
@@ -573,6 +603,14 @@ def main():
     # 主循环
     try:
         while True:
+            # 处理按键事件（在主线程中执行，消除线程竞争）
+            while not button_event_queue.empty():
+                try:
+                    event = button_event_queue.get_nowait()
+                    handle_button_event(event)
+                except queue.Empty:
+                    break
+
             ret, frame = cam.read()
             if not ret:
                 continue
